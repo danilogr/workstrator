@@ -1,6 +1,6 @@
-# Workstrator — Getting Started
+# Workstrator
 
-Workstrator is an autonomous agent orchestrator that watches your GitHub project board and dispatches Claude Code agents to work on issues. It runs as a background daemon on macOS, polling every 3 minutes for work.
+An autonomous agent orchestrator that watches your GitHub project board and dispatches [Claude Code](https://claude.ai/claude-code) agents to work on issues. It runs as a background daemon on macOS, polling every 3 minutes for work.
 
 ## How It Works
 
@@ -99,73 +99,39 @@ your-workspace/              # Parent directory
 ├── repo-c/
 └── workstrator/             # This directory
     ├── workstrator.sh       # Main orchestrator daemon
-    ├── agent-prompt.md      # Agent system prompt
+    ├── config.sh            # Your config (created from config.example.sh)
+    ├── architecture.md      # Your platform architecture (optional)
+    ├── agent-prompt.md      # Agent system prompt (state machine + conventions)
     ├── dashboard.py         # Terminal UI
     ├── .stream-parser.py    # Stream-json → text parser
     ├── install.sh           # Install as launchd service
-    ├── uninstall.sh         # Remove service
-    ├── logs/                # Auto-created: agent + orchestrator logs
-    ├── state/               # Auto-created: fingerprint tracking
-    ├── running.json         # Auto-created: currently running agents
-    └── board-cache.json     # Auto-created: board data for dashboard
+    └── uninstall.sh         # Remove service
 ```
 
-Clone or copy the `workstrator/` directory into your workspace:
+### 2. Create Your Config
 
 ```bash
-# Option A: Clone just the workstrator directory
-cd ~/Projects/my-workspace
-git clone <workstrator-repo-url> workstrator
-
-# Option B: Copy from an existing setup
-cp -r /path/to/workstrator ~/Projects/my-workspace/workstrator
+cp config.example.sh config.sh
 ```
 
-### 2. Configure `workstrator.sh`
-
-Edit the top of `workstrator.sh`:
+Edit `config.sh` with your GitHub org, bot account, repos, and project board IDs:
 
 ```bash
-ORG="your-github-org"         # Your GitHub org
-PROJECT_NUMBER=1              # Your project board number
-BOT_LOGIN="your-bot-account"  # Your bot's GitHub username
-POLL_INTERVAL=180             # Seconds between poll cycles (3 min)
-AGENT_MODEL="opus"            # Claude model to use
-```
-
-Update the `REPOS` variable with all repos the bot should monitor:
-
-```bash
+ORG="your-github-org"
+PROJECT_NUMBER=1
+BOT_LOGIN="your-bot-account"
 REPOS="repo-a repo-b repo-c"
+AGENT_MODEL="opus"
 ```
 
-Update `repo_to_local()` if any GitHub repo names differ from local directory names:
-
-```bash
-repo_to_local() {
-  case "$1" in
-    my-github-repo)  echo "my-local-dirname" ;;
-    *)               echo "$1" ;;  # Default: same name
-  esac
-}
-```
-
-### 3. Configure `agent-prompt.md`
-
-This is the system prompt injected into every agent invocation. You need to customize:
-
-1. **Platform Architecture** — Replace the architecture diagram and service table with your own. This helps the planner understand how services relate to each other.
-
-2. **Service → Repo Map** — Update the table with your repos, runtimes, and descriptions.
-
-3. **Project Board IDs** — Find and replace all project/field/option IDs:
+### 3. Find Project Board IDs
 
 ```bash
 # Get project ID
-gh project list --owner YOUR_ORG --format json | jq '.projects[] | {title, id}'
+gh project list --owner $ORG --format json | jq '.projects[] | {title, id, number}'
 
 # Get field IDs
-gh project field-list PROJECT_NUMBER --owner YOUR_ORG --format json \
+gh project field-list $PROJECT_NUMBER --owner $ORG --format json \
   | jq '.fields[] | {name, id}'
 
 # Get status option IDs (Todo, In progress, Done)
@@ -184,15 +150,27 @@ gh api graphql -f query='
 '
 ```
 
-Then update the IDs in:
-- The **Project Board** section of `agent-prompt.md`
-- The planner and worker prompt templates in `workstrator.sh` (search for `project item-edit`)
+Add the IDs to `config.sh`:
 
-4. **Firestore / Data Model** — Replace or remove the Firestore section. If your project uses a different database, document its collections and key fields here. If not applicable, delete the section.
+```bash
+PROJECT_ID="PVT_kwXXXXXX"
+STATUS_FIELD_ID="PVTSSF_XXXXXXX"
+STATUS_TODO="xxxxxxxx"
+STATUS_IN_PROGRESS="xxxxxxxx"
+STATUS_DONE="xxxxxxxx"
+```
 
-5. **Integration Points** — Replace with your own service-to-service integration details. This helps the planner understand cross-repo dependencies.
+### 4. Document Your Architecture (Optional)
 
-### 4. Add Per-Repo CLAUDE.md Files
+If your platform has multiple services, create `architecture.md` from the example:
+
+```bash
+cp architecture.example.md architecture.md
+```
+
+Edit it with your service map, database collections, and integration points. This gets injected into every agent's system prompt so the Planner understands cross-repo relationships.
+
+### 5. Add Per-Repo CLAUDE.md Files
 
 Each repo can have its own `CLAUDE.md` at its root with repo-specific coding conventions. The orchestrator automatically injects the repo's CLAUDE.md into the agent's system prompt alongside `agent-prompt.md`.
 
@@ -215,7 +193,7 @@ Example `CLAUDE.md` for a TypeScript repo:
 - Lint: `npm run lint`
 ```
 
-### 5. Install
+### 6. Install
 
 ```bash
 cd path/to/workstrator
@@ -231,7 +209,7 @@ This registers a macOS LaunchAgent that:
 
 ```bash
 # Check service status
-launchctl print gui/$(id -u)/com.appliedmindai.workstrator
+launchctl print gui/$(id -u)/com.workstrator
 
 # Check logs
 tail -f workstrator/logs/workstrator.log
@@ -266,7 +244,7 @@ Split-pane terminal UI:
 | Key | Action |
 |---|---|
 | `Up` / `Down` | Select issue in queue |
-| `Tab` | Cycle right pane: Auto -> Planner -> Worker -> Auto |
+| `Tab` | Cycle right pane: Auto → Planner → Worker → Auto |
 | `PgUp` / `PgDn` | Scroll agent log |
 | `r` | Force refresh |
 | `q` | Quit |
@@ -312,7 +290,7 @@ GitHub allows 5,000 GraphQL calls/hour. Key costs:
 | Issue detail fetch | ~1 per assigned issue | Every poll |
 | Agent `gh` commands | Varies | During agent runs |
 
-At 20 polls/hour with ~11 repos, the orchestrator uses ~2,400/hour, leaving headroom for agent work.
+At 20 polls/hour with ~10 repos, the orchestrator uses ~2,400/hour, leaving headroom for agent work.
 
 The dashboard reads from files only — it contributes zero API cost.
 
@@ -325,15 +303,13 @@ Polling... (GraphQL remaining: 4685)
 Poll complete. ... GraphQL: 4685→4664 (used 21)
 ```
 
-If you see the remaining count dropping fast between polls, something external (another tool, CI, etc.) is consuming your quota.
-
 ---
 
 ## Troubleshooting
 
 ### Agent not picking up an issue
 
-1. **Is the repo in the REPOS list?** Check `REPOS=` in `workstrator.sh`.
+1. **Is the repo in REPOS?** Check `REPOS=` in `config.sh`.
 2. **Is the issue assigned to the bot?** Check `gh issue view NUM --repo ORG/REPO --json assignees`.
 3. **Does `agent-waiting` need removal?** If the bot posted and is waiting, reply to trigger auto-removal.
 4. **Check the fingerprint**: `cat state/planner-REPO-NUM` or `state/worker-REPO-NUM`. Delete the state file to force reprocessing.
@@ -348,7 +324,7 @@ If you see the remaining count dropping fast between polls, something external (
 
 - Check: `gh api rate_limit --jq '.resources.graphql'`
 - Resets every hour. The orchestrator and dashboard will resume automatically.
-- To reduce cost: increase `POLL_INTERVAL` in `workstrator.sh`.
+- To reduce cost: increase `POLL_INTERVAL` in `config.sh`.
 
 ### Service won't start
 
@@ -370,7 +346,11 @@ If you see the remaining count dropping fast between polls, something external (
 | File | Purpose |
 |---|---|
 | `workstrator.sh` | Main daemon — polls, routes, spawns agents |
-| `agent-prompt.md` | Agent system prompt — architecture, state machine, conventions |
+| `config.sh` | Your configuration (gitignored) |
+| `config.example.sh` | Configuration template |
+| `architecture.md` | Your platform architecture (optional, gitignored) |
+| `architecture.example.md` | Architecture template |
+| `agent-prompt.md` | Agent system prompt — state machine, conventions |
 | `dashboard.py` | Terminal UI — reads local files, zero API cost |
 | `.stream-parser.py` | Converts Claude's stream-json output to readable text |
 | `install.sh` | Registers macOS LaunchAgent |
@@ -383,3 +363,7 @@ If you see the remaining count dropping fast between polls, something external (
 | `running.json` | Currently running agents (read by dashboard) |
 | `board-cache.json` | Project board snapshot (written by workstrator, read by dashboard) |
 | `.lock/` | Single-instance lock (mkdir-based, atomic) |
+
+## License
+
+MIT

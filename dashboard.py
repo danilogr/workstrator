@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Workstrator v3 Dashboard — split-pane terminal UI with planner + worker agents."""
+"""Workstrator Dashboard — split-pane terminal UI with planner + worker agents."""
 
 import curses
 import json
 import os
+import re
 import subprocess
 import time
 from datetime import datetime, timezone
@@ -14,13 +15,30 @@ LOG_DIR = SCRIPT_DIR / "logs"
 STATE_DIR = SCRIPT_DIR / "state"
 RUNNING_FILE = SCRIPT_DIR / "running.json"
 BOARD_FILE = SCRIPT_DIR / "board-cache.json"
-
-ORG = "appliedmindai"
-PROJECT_NUMBER = "1"
+CONFIG_FILE = SCRIPT_DIR / "config.sh"
 
 # Refresh intervals
 BOARD_REFRESH = 10  # seconds between board file reads (free — reads file written by workstrator)
 LOG_REFRESH = 1     # seconds between log file reads
+
+
+def read_config() -> dict[str, str]:
+    """Parse config.sh for simple KEY=VALUE or KEY="VALUE" assignments."""
+    config: dict[str, str] = {}
+    if not CONFIG_FILE.exists():
+        return config
+    for line in CONFIG_FILE.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        match = re.match(r'^([A-Z_]+)=["\']?([^"\']*)["\']?\s*(?:#.*)?$', line)
+        if match:
+            config[match.group(1)] = match.group(2)
+    return config
+
+
+_CONFIG = read_config()
+LAUNCHD_LABEL = _CONFIG.get("LAUNCHD_LABEL", "com.workstrator")
 
 
 def run(cmd: str, timeout: int = 15) -> str:
@@ -34,7 +52,7 @@ def run(cmd: str, timeout: int = 15) -> str:
 
 
 def is_workstrator_running() -> bool:
-    result = run("launchctl print gui/$(id -u)/com.appliedmindai.workstrator 2>&1")
+    result = run(f"launchctl print gui/$(id -u)/{LAUNCHD_LABEL} 2>&1")
     return "state = running" in result
 
 
@@ -194,8 +212,6 @@ class Dashboard:
                         key = f"{agent.get('repo')}-{agent.get('num')}"
                         label = f"{role.title()}: {agent.get('repo')}#{agent.get('num')}"
                         return label, get_agent_logs(role, key)
-                # Pinned role not running — show the pinned role's most recent log anyway
-                # (fall through to idle logic below)
             else:
                 # Auto: prefer worker, then planner
                 for preferred in ("worker", "planner"):
@@ -266,13 +282,13 @@ class Dashboard:
         status_color = curses.color_pair(1) if self.workstrator_running else curses.color_pair(3)
 
         self.safe_addstr(0, 0, " " * w, curses.color_pair(8) | curses.A_BOLD)
-        self.safe_addstr(0, 1, "Workstrator v3", curses.color_pair(8) | curses.A_BOLD)
+        self.safe_addstr(0, 1, "Workstrator", curses.color_pair(8) | curses.A_BOLD)
 
         # Show agent count
         if self.running_agents:
             roles = "/".join(a.get("role", "?")[0].upper() for a in self.running_agents)
             agent_info = f" [{roles}] "
-            self.safe_addstr(0, 16, agent_info, curses.color_pair(8))
+            self.safe_addstr(0, 13, agent_info, curses.color_pair(8))
 
         self.safe_addstr(0, w - len(status) - 3, f" {status} ", status_color | curses.A_BOLD)
 

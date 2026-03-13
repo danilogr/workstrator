@@ -2,7 +2,14 @@
 # Uninstall the workstrator LaunchAgent
 set -euo pipefail
 
-LABEL="com.appliedmindai.workstrator"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Load config for LAUNCHD_LABEL
+if [[ -f "$SCRIPT_DIR/config.sh" ]]; then
+  source "$SCRIPT_DIR/config.sh"
+fi
+
+LABEL="${LAUNCHD_LABEL:-com.workstrator}"
 PLIST_PATH="$HOME/Library/LaunchAgents/$LABEL.plist"
 
 # Stop and unload
@@ -12,4 +19,4 @@ launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
 rm -f "$PLIST_PATH"
 
 echo "Workstrator uninstalled."
-echo "  Logs are still at: $(cd "$(dirname "$0")" && pwd)/logs/"
+echo "  Logs are still at: $SCRIPT_DIR/logs/"

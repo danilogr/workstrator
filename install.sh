@@ -1,12 +1,22 @@
 #!/usr/bin/env bash
-# Install the workstrator as a macOS LaunchAgent (runs forever, auto-restarts)
+# Install workstrator as a macOS LaunchAgent (runs forever, auto-restarts)
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-LABEL="com.appliedmindai.workstrator"
+LOG_DIR="$SCRIPT_DIR/logs"
+
+# Load config for LAUNCHD_LABEL
+if [[ ! -f "$SCRIPT_DIR/config.sh" ]]; then
+  echo "ERROR: config.sh not found. Run:"
+  echo "  cp config.example.sh config.sh"
+  echo "  $EDITOR config.sh"
+  exit 1
+fi
+source "$SCRIPT_DIR/config.sh"
+
+LABEL="${LAUNCHD_LABEL:-com.workstrator}"
 PLIST_DIR="$HOME/Library/LaunchAgents"
 PLIST_PATH="$PLIST_DIR/$LABEL.plist"
-LOG_DIR="$SCRIPT_DIR/logs"
 
 mkdir -p "$PLIST_DIR" "$LOG_DIR"
 

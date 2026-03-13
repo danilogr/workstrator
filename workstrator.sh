@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Workstrator v3 — Planner + Worker Agent Orchestrator
+# Workstrator — Planner + Worker Agent Orchestrator
 #
 # Two-agent model:
 #   PLANNER — reads issues, posts plans, revises on feedback, detects approval,
@@ -7,11 +7,11 @@
 #   WORKER  — implements approved plans in a git worktree, self-reviews, creates PRs.
 #
 # Signal model:
-#   - Assigned to appliedmind-agent     → bot should work on it
-#   - `agent-waiting` label             → bot posted, needs human input (skip)
-#   - `plan-approved` label             → plan approved, ready for worker
-#   - `agent-waiting` + human reply     → auto-remove label (next cycle picks up)
-#   - Issue closed                      → skip
+#   - Assigned to bot account          → bot should work on it
+#   - `agent-waiting` label            → bot posted, needs human input (skip)
+#   - `plan-approved` label            → plan approved, ready for worker
+#   - `agent-waiting` + human reply    → auto-remove label (next cycle picks up)
+#   - Issue closed                     → skip
 #
 # Routing:
 #   - Has `plan-approved`, no `agent-waiting` → WORKER
@@ -27,9 +27,11 @@
 # ── Files ─────────────────────────────────────────────────────────────
 #
 #   workstrator.sh              This script (outer loop)
-#   .stream-parser.py           Stream-json → text parser
-#   agent-prompt.md              Agent system prompt (shared conventions)
+#   config.sh                   User configuration (ORG, REPOS, board IDs, etc.)
+#   architecture.md             Optional platform architecture (injected into prompts)
+#   agent-prompt.md             Agent system prompt (shared conventions)
 #   dashboard.py                Split-pane curses dashboard
+#   .stream-parser.py           Stream-json → text parser
 #   install.sh / uninstall.sh   launchd service management
 #   logs/                       workstrator.log + per-agent logs
 #   state/                      Fingerprint files (role-prefixed)
@@ -39,17 +41,35 @@
 set -uo pipefail
 
 # ---------------------------------------------------------------------------
-# Configuration
+# Load configuration
 # ---------------------------------------------------------------------------
-ORG="appliedmindai"
-PROJECT_NUMBER=1
-BOT_LOGIN="appliedmind-agent"
-POLL_INTERVAL=180           # seconds between poll cycles (3 min)
-AGENT_MODEL="opus"
-
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+if [[ ! -f "$SCRIPT_DIR/config.sh" ]]; then
+  echo "ERROR: config.sh not found. Copy config.example.sh to config.sh and customize it."
+  echo "  cp $SCRIPT_DIR/config.example.sh $SCRIPT_DIR/config.sh"
+  exit 1
+fi
+
+# shellcheck source=config.example.sh
+source "$SCRIPT_DIR/config.sh"
+
+# Validate required config
+for var in ORG PROJECT_NUMBER BOT_LOGIN REPOS AGENT_MODEL; do
+  if [[ -z "${!var:-}" ]]; then
+    echo "ERROR: $var is not set in config.sh"
+    exit 1
+  fi
+done
+
+POLL_INTERVAL="${POLL_INTERVAL:-180}"
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 INSTRUCTIONS="$SCRIPT_DIR/agent-prompt.md"
+ARCHITECTURE="$SCRIPT_DIR/architecture.md"
 PARSER="$SCRIPT_DIR/.stream-parser.py"
 LOG_DIR="$SCRIPT_DIR/logs"
 STATE_DIR="$SCRIPT_DIR/state"
@@ -102,26 +122,6 @@ log() {
 }
 
 # ---------------------------------------------------------------------------
-# Repo mapping: GitHub repo name → local directory name
-# ---------------------------------------------------------------------------
-repo_to_local() {
-  case "$1" in
-    rtc)                        echo "rtc" ;;
-    navi-rtc-service)           echo "navi-rtc-service" ;;
-    vue-rtc-web)                echo "vue-rtc-web" ;;
-    vue-ios)                    echo "vue-ios" ;;
-    appliedmind-dashboard-api)  echo "appliedmind-dashboard-api" ;;
-    dashboard-spa)              echo "dashboard-spa" ;;
-    superadmin-dashboard)       echo "superadmin-dashboard" ;;
-    core-types)                 echo "core-types" ;;
-    platform-types)             echo "platform-types" ;;
-    synthlabel)                 echo "synthlabel" ;;
-    platform)                   echo "platform" ;;
-    *)                          echo "$1" ;;
-  esac
-}
-
-# ---------------------------------------------------------------------------
 # State tracking — separate files per role to avoid transition conflicts
 # ---------------------------------------------------------------------------
 read_state() {
@@ -171,11 +171,6 @@ get_issue_info() {
       is_open: (.state == "OPEN")
     } | "\(.comment_count):\(.assigned_to_bot):\(.agent_waiting):\(.plan_approved):\(.last_author):\(.is_open)"' 2>/dev/null || echo "error"
 }
-
-# ---------------------------------------------------------------------------
-# Repos to scan
-# ---------------------------------------------------------------------------
-REPOS="rtc navi-rtc-service vue-rtc-web vue-ios appliedmind-dashboard-api dashboard-spa superadmin-dashboard core-types platform-types synthlabel platform"
 
 # ---------------------------------------------------------------------------
 # Find bot-assigned issues (1 API call per repo)
@@ -233,7 +228,6 @@ create_worktree() {
 
   if [[ -d "$worktree_dir" ]]; then
     # Resume existing worktree — sync with main
-    # Redirect all stdout to /dev/null so git output doesn't leak into captured path
     (
       cd "$worktree_dir"
       git fetch origin || true
@@ -262,6 +256,28 @@ create_worktree() {
   if [[ -d "$worktree_dir" ]]; then
     echo "$worktree_dir"
   fi
+}
+
+# ---------------------------------------------------------------------------
+# Build system prompt (shared across planner + worker)
+# ---------------------------------------------------------------------------
+build_system_prompt() {
+  local repo_dir="$1"
+  local system_prompt
+  system_prompt=$(cat "$INSTRUCTIONS")
+
+  # Inject architecture docs if present
+  if [[ -f "$ARCHITECTURE" ]]; then
+    system_prompt+=$'\n\n'"$(cat "$ARCHITECTURE")"
+  fi
+
+  # Inject repo-specific CLAUDE.md if present
+  if [[ -f "$repo_dir/CLAUDE.md" ]]; then
+    system_prompt+=$'\n\n# Repo-Specific Conventions\n\n'
+    system_prompt+=$(cat "$repo_dir/CLAUDE.md")
+  fi
+
+  echo "$system_prompt"
 }
 
 # ---------------------------------------------------------------------------
@@ -315,6 +331,7 @@ HEADER
 
 ## Parameters
 
+- **Org:** ${ORG}
 - **Repo:** ${ORG}/${repo}
 - **Working directory:** ${work_dir}
 - **Bot account:** ${BOT_LOGIN}
@@ -351,7 +368,7 @@ When you detect approval:
 2. Add the `plan-approved` label — this signals the Worker agent to implement.
 3. If this is a story/epic, create sub-issues:
    - Each sub-issue gets: parent link, scope from plan, files to change, acceptance criteria
-   - Each sub-issue is assigned to `appliedmind-agent`
+   - Each sub-issue is assigned to the bot account (see Parameters above)
    - Each sub-issue gets the `plan-approved` label (inherits approval from parent)
    - Edit parent issue body to include a checklist of sub-issues with links
    - For the parent: add `agent-waiting` label (wait for sub-issues to complete)
@@ -374,17 +391,17 @@ Read full comment history carefully. Either post a clarifying comment + `agent-w
 - For cross-repo work, read CLAUDE.md in ALL affected repos.
 STATIC
 
-  # Part 5: board status commands with variables
+  # Part 5: board status commands with config variables
   cat >> "$prompt_file" <<BOARD
 
 ## Project Board Status
 
 \`\`\`bash
 # Set to "In progress"
-gh project item-edit --project-id PVT_kwDODiNdOM4BIKRk --id "${item_id}" --field-id PVTSSF_lADODiNdOM4BIKRkzg4tBQA --single-select-option-id 47fc9ee4
+gh project item-edit --project-id ${PROJECT_ID} --id "${item_id}" --field-id ${STATUS_FIELD_ID} --single-select-option-id ${STATUS_IN_PROGRESS}
 
 # Set to "Todo" (revert if blocked)
-gh project item-edit --project-id PVT_kwDODiNdOM4BIKRk --id "${item_id}" --field-id PVTSSF_lADODiNdOM4BIKRkzg4tBQA --single-select-option-id f75ad846
+gh project item-edit --project-id ${PROJECT_ID} --id "${item_id}" --field-id ${STATUS_FIELD_ID} --single-select-option-id ${STATUS_TODO}
 \`\`\`
 
 ## Repo Conventions
@@ -398,13 +415,9 @@ Follow these conventions strictly — they define types, patterns, and structure
 Take ONE action and exit. You will be called again on the next poll cycle.
 BOARD
 
-  # Build system prompt: base instructions + repo CLAUDE.md
+  # Build system prompt
   local system_prompt
-  system_prompt=$(cat "$INSTRUCTIONS")
-  if [[ -f "$work_dir/CLAUDE.md" ]]; then
-    system_prompt+=$'\n\n# Repo-Specific Conventions\n\n'
-    system_prompt+=$(cat "$work_dir/CLAUDE.md")
-  fi
+  system_prompt=$(build_system_prompt "$work_dir")
 
   log "PLANNER: Starting for $ORG/$repo#$num"
 
@@ -499,6 +512,7 @@ HEADER
 
 ## Parameters
 
+- **Org:** ${ORG}
 - **Repo:** ${ORG}/${repo}
 - **Working directory:** ${worktree_dir} (pre-created git worktree)
 - **Branch:** ${branch_name}
@@ -558,12 +572,7 @@ Add `agent-waiting` label and exit.
 ## Self-Review Checklist (before creating any PR)
 
 1. Run `git diff main...HEAD` to see all your changes.
-2. Review against the repo's CLAUDE.md standards:
-   - No `any` types
-   - All function parameters and return types explicit
-   - async/await only (no `.then()` chains)
-   - No leaked internals in API responses
-   - Allowlist serialization (no spread-to-omit)
+2. Review against the repo's CLAUDE.md standards.
 3. Check for: bugs, code duplication, missing types, security issues, unused imports.
 4. Fix any issues found and commit the fixes.
 5. Only then create the PR.
@@ -584,10 +593,10 @@ STATIC
 
 \`\`\`bash
 # Set to "In progress"
-gh project item-edit --project-id PVT_kwDODiNdOM4BIKRk --id "${item_id}" --field-id PVTSSF_lADODiNdOM4BIKRkzg4tBQA --single-select-option-id 47fc9ee4
+gh project item-edit --project-id ${PROJECT_ID} --id "${item_id}" --field-id ${STATUS_FIELD_ID} --single-select-option-id ${STATUS_IN_PROGRESS}
 
 # Set to "Done"
-gh project item-edit --project-id PVT_kwDODiNdOM4BIKRk --id "${item_id}" --field-id PVTSSF_lADODiNdOM4BIKRkzg4tBQA --single-select-option-id 98236657
+gh project item-edit --project-id ${PROJECT_ID} --id "${item_id}" --field-id ${STATUS_FIELD_ID} --single-select-option-id ${STATUS_DONE}
 \`\`\`
 
 ## Repo Conventions
@@ -603,11 +612,7 @@ BOARD
 
   # Build system prompt
   local system_prompt
-  system_prompt=$(cat "$INSTRUCTIONS")
-  if [[ -f "$repo_dir/CLAUDE.md" ]]; then
-    system_prompt+=$'\n\n# Repo-Specific Conventions\n\n'
-    system_prompt+=$(cat "$repo_dir/CLAUDE.md")
-  fi
+  system_prompt=$(build_system_prompt "$repo_dir")
 
   log "WORKER: Starting for $ORG/$repo#$num (worktree: $worktree_dir)"
 
@@ -830,10 +835,11 @@ trap shutdown SIGTERM SIGINT
 # Main loop
 # ---------------------------------------------------------------------------
 log "=========================================="
-log "Workstrator v3 starting (planner + worker)"
+log "Workstrator starting (planner + worker)"
 log "  Org:            $ORG"
 log "  Project:        #$PROJECT_NUMBER"
 log "  Bot:            $BOT_LOGIN"
+log "  Repos:          $REPOS"
 log "  Poll interval:  ${POLL_INTERVAL}s"
 log "  Agent model:    $AGENT_MODEL"
 log "=========================================="

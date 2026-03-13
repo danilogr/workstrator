@@ -1,3 +1,7 @@
+# User config (contains org-specific IDs and secrets)
+config.sh
+architecture.md
+
 # Runtime artifacts
 logs/
 state/
