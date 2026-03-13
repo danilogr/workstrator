@@ -1,0 +1,9 @@
+# Runtime artifacts
+logs/
+state/
+running.json
+board-cache.json
+.lock/
+workstrator.pid
+__pycache__/
+*.pyc
