@@ -4,10 +4,10 @@ An autonomous agent orchestrator that watches your GitHub project board and disp
 
 ## How It Works
 
-Two specialized agents run in parallel:
+Multiple **Planner** agents and a single **Worker** agent run in parallel:
 
 ```
-                   GitHub Issue
+                   GitHub Issues
                        │
                  Assigned to bot
                        │
@@ -15,15 +15,16 @@ Two specialized agents run in parallel:
           │                         │
     No plan-approved          Has plan-approved
           │                         │
-     ┌────┴────┐              ┌─────┴─────┐
-     │ PLANNER │              │  WORKER   │
-     └────┬────┘              └─────┬─────┘
+   ┌──────┴──────┐            ┌─────┴─────┐
+   │  PLANNERS   │            │  WORKER   │
+   │ (up to N)   │            │ (single)  │
+   └──────┬──────┘            └─────┬─────┘
           │                         │
-  Reads code, posts plan      Implements in
-  Revises on feedback         git worktree
-  Detects approval            Self-reviews
-  Adds plan-approved label    Creates PR
-  Creates sub-issues          Posts results
+  Read code, post plans       Implements in
+  Revise on feedback          git worktree
+  Detect approval             Self-reviews
+  Add plan-approved label     Creates PR
+  Create sub-issues           Posts results
           │                         │
           └────────────┬────────────┘
                        │
@@ -31,7 +32,7 @@ Two specialized agents run in parallel:
               (ball in human's court)
 ```
 
-**Planner** reads issues and the codebase, writes implementation plans, revises them based on feedback, and when the human approves, adds the `plan-approved` label. It runs in the repo root directory (read-only — never modifies code).
+**Planners** (up to `MAX_PLANNERS` concurrent, default 5) read issues and the codebase, write implementation plans, revise them based on feedback, and when the human approves, add the `plan-approved` label. They run in the repo root directory (read-only — never modify code). Multiple planners can work on different issues simultaneously.
 
 **Worker** picks up issues with `plan-approved`, creates an isolated git worktree, implements the plan, self-reviews against the repo's CLAUDE.md standards, and creates a PR. It runs in the worktree so it never conflicts with your working copy.
 
@@ -42,7 +43,7 @@ Two specialized agents run in parallel:
 | Assign issue to bot account | "Work on this" |
 | `agent-waiting` label | Bot posted something, waiting for human |
 | `plan-approved` label | Plan approved, worker should implement |
-| Human replies (while `agent-waiting`) | Label auto-removed, agent re-engages next cycle |
+| Human replies (while `agent-waiting`) | Label auto-removed, agent re-engages immediately |
 | Close issue | Done, agent ignores it |
 
 ### Lifecycle of an Issue
@@ -122,6 +123,7 @@ PROJECT_NUMBER=1
 BOT_LOGIN="your-bot-account"
 REPOS="repo-a repo-b repo-c"
 AGENT_MODEL="opus"
+MAX_PLANNERS=5       # concurrent planner agents (default: 5)
 ```
 
 ### 3. Find Project Board IDs
@@ -236,8 +238,9 @@ python3 dashboard.py
 ```
 
 Split-pane terminal UI:
-- **Left pane**: Running agents (Planner/Worker), issue queue, recent orchestrator log
-- **Right pane**: Live agent output (streams as the agent works)
+- **Header**: Poll countdown, GraphQL remaining, service status
+- **Left pane**: Running agents (Planners/Worker), issue queue, recent orchestrator log
+- **Right pane**: Live agent output (auto-selects most recent planner when multiple are running)
 
 ### Keybindings
 
@@ -300,8 +303,10 @@ The orchestrator logs GraphQL usage every poll cycle:
 
 ```
 Polling... (GraphQL remaining: 4685)
-Poll complete. ... GraphQL: 4685→4664 (used 21)
+Poll complete. Checked 5 issues. Planners: 2 active. Worker: idle. GraphQL: 4685→4664 (used 21)
 ```
+
+The dashboard also shows a live poll countdown and GraphQL remaining in the header bar.
 
 ---
 
