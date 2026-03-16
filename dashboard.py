@@ -39,6 +39,7 @@ def read_config() -> dict[str, str]:
 
 _CONFIG = read_config()
 LAUNCHD_LABEL = _CONFIG.get("LAUNCHD_LABEL", "com.workstrator")
+POLL_INTERVAL = int(_CONFIG.get("POLL_INTERVAL", "180"))
 
 
 def run(cmd: str, timeout: int = 15) -> str:
@@ -110,6 +111,45 @@ def get_most_recent_log() -> tuple[str, list[str]]:
     return f"Last: {all_logs[0].stem}", header + content.split("\n")
 
 
+def get_poll_info(log_lines: list[str]) -> tuple[int, str]:
+    """Parse last poll timestamp and GraphQL remaining from workstrator log.
+
+    Returns (seconds_until_next_poll, graphql_remaining_str).
+    """
+    last_poll_time: datetime | None = None
+    gql_remaining = ""
+
+    for line in reversed(log_lines):
+        # Parse GraphQL remaining from "Polling... (GraphQL remaining: N)"
+        # or from "Poll complete... GraphQL: X→Y (used Z)"
+        if not gql_remaining:
+            m = re.search(r"GraphQL remaining: (\d+)", line)
+            if m:
+                gql_remaining = m.group(1)
+            else:
+                m = re.search(r"GraphQL: \d+→(\d+)", line)
+                if m:
+                    gql_remaining = m.group(1)
+
+        # Parse last poll timestamp from "[YYYY-MM-DDTHH:MM:SSZ] Polling..."
+        if last_poll_time is None:
+            m = re.match(r"\[(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})Z\] Polling\.\.\.", line)
+            if m:
+                last_poll_time = datetime.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S").replace(
+                    tzinfo=timezone.utc
+                )
+
+        if last_poll_time and gql_remaining:
+            break
+
+    countdown = -1
+    if last_poll_time:
+        elapsed = (datetime.now(timezone.utc) - last_poll_time).total_seconds()
+        countdown = max(0, int(POLL_INTERVAL - elapsed))
+
+    return countdown, gql_remaining
+
+
 def get_project_board_issues() -> list[dict]:
     """Read board data from file cache written by workstrator (zero API cost)."""
     if not BOARD_FILE.exists():
@@ -159,6 +199,8 @@ class Dashboard:
         self.cached_workstrator_log: list[str] = []
         self.workstrator_running = False
         self.active_log_role: str | None = None  # None = auto, "planner"/"worker" = pinned
+        self.poll_countdown: int = -1
+        self.gql_remaining: str = ""
         self.setup_colors()
 
     def setup_colors(self):
@@ -213,14 +255,17 @@ class Dashboard:
                         label = f"{role.title()}: {agent.get('repo')}#{agent.get('num')}"
                         return label, get_agent_logs(role, key)
             else:
-                # Auto: prefer worker, then planner
+                # Auto: prefer worker, then most recent planner
                 for preferred in ("worker", "planner"):
-                    for agent in self.running_agents:
-                        if agent.get("role") == preferred:
-                            key = f"{agent.get('repo')}-{agent.get('num')}"
-                            r = agent.get("role", "agent")
-                            label = f"{r.title()}: {agent.get('repo')}#{agent.get('num')}"
-                            return label, get_agent_logs(r, key)
+                    matching = [a for a in self.running_agents if a.get("role") == preferred]
+                    if matching:
+                        agent = max(matching, key=lambda a: a.get("started", ""))
+                        key = f"{agent.get('repo')}-{agent.get('num')}"
+                        r = agent.get("role", "agent")
+                        label = f"{r.title()}: {agent.get('repo')}#{agent.get('num')}"
+                        if len(matching) > 1:
+                            label += f" (+{len(matching) - 1})"
+                        return label, get_agent_logs(r, key)
 
         # Idle or pinned role not running — show log for selected issue
         if self.non_done and self.selected_idx < len(self.non_done):
@@ -264,7 +309,8 @@ class Dashboard:
         # Logs — refresh frequently
         if now - self.last_log_fetch > LOG_REFRESH:
             self.cached_agent_label, self.cached_agent_log = self._get_log_for_display()
-            self.cached_workstrator_log = get_workstrator_log(15)
+            self.cached_workstrator_log = get_workstrator_log(50)
+            self.poll_countdown, self.gql_remaining = get_poll_info(self.cached_workstrator_log)
             self.last_log_fetch = now
 
     def safe_addstr(self, y: int, x: int, text: str, attr: int = 0):
@@ -285,12 +331,25 @@ class Dashboard:
         self.safe_addstr(0, 1, "Workstrator", curses.color_pair(8) | curses.A_BOLD)
 
         # Show agent count
+        right_offset = len(status) + 3
         if self.running_agents:
             roles = "/".join(a.get("role", "?")[0].upper() for a in self.running_agents)
             agent_info = f" [{roles}] "
             self.safe_addstr(0, 13, agent_info, curses.color_pair(8))
 
-        self.safe_addstr(0, w - len(status) - 3, f" {status} ", status_color | curses.A_BOLD)
+        # Poll countdown + GraphQL remaining — center area of header
+        mid_parts: list[str] = []
+        if self.poll_countdown >= 0:
+            mins, secs = divmod(self.poll_countdown, 60)
+            mid_parts.append(f"Next poll: {mins}:{secs:02d}")
+        if self.gql_remaining:
+            mid_parts.append(f"GQL: {self.gql_remaining}")
+        if mid_parts:
+            mid_text = " | ".join(mid_parts)
+            mid_x = max(0, (w - len(mid_text)) // 2)
+            self.safe_addstr(0, mid_x, mid_text, curses.color_pair(8))
+
+        self.safe_addstr(0, w - right_offset, f" {status} ", status_color | curses.A_BOLD)
 
     def draw_left_pane(self):
         h, w = self.stdscr.getmaxyx()

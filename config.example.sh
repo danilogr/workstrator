@@ -28,6 +28,9 @@ POLL_INTERVAL=180
 # Claude model: "opus", "sonnet", or "haiku"
 AGENT_MODEL="opus"
 
+# Max concurrent planner agents (default: 5)
+MAX_PLANNERS=5
+
 # ── Repos ────────────────────────────────────────────────────────────
 
 # Space-separated list of GitHub repo names to monitor.

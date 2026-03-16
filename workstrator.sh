@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Workstrator — Planner + Worker Agent Orchestrator
 #
-# Two-agent model:
-#   PLANNER — reads issues, posts plans, revises on feedback, detects approval,
-#             adds `plan-approved` label, creates sub-issues. Runs in repo root (read-only).
-#   WORKER  — implements approved plans in a git worktree, self-reviews, creates PRs.
+# Multi-planner + single-worker model:
+#   PLANNER (up to MAX_PLANNERS concurrent) — reads issues, posts plans, revises on
+#             feedback, detects approval, adds `plan-approved` label, creates sub-issues.
+#             Runs in repo root (read-only).
+#   WORKER  (single) — implements approved plans in a git worktree, self-reviews, creates PRs.
 #
 # Signal model:
 #   - Assigned to bot account          → bot should work on it
@@ -63,6 +64,7 @@ for var in ORG PROJECT_NUMBER BOT_LOGIN REPOS AGENT_MODEL; do
 done
 
 POLL_INTERVAL="${POLL_INTERVAL:-180}"
+MAX_PLANNERS="${MAX_PLANNERS:-5}"
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -79,13 +81,26 @@ LOCKDIR="$SCRIPT_DIR/.lock"
 mkdir -p "$LOG_DIR" "$STATE_DIR"
 
 # ---------------------------------------------------------------------------
-# Agent tracking (simple variables — only 2 slots)
+# Agent tracking — parallel arrays for planners, single slot for worker
 # ---------------------------------------------------------------------------
-PLANNER_PID=""
-PLANNER_KEY=""
-PLANNER_REPO=""
-PLANNER_NUM=""
-PLANNER_STARTED=""
+PLANNER_PIDS=()
+PLANNER_KEYS=()
+PLANNER_REPOS=()
+PLANNER_NUMS=()
+PLANNER_STARTEDS=()
+
+# Planner array helpers
+active_planner_count() {
+  echo "${#PLANNER_PIDS[@]}"
+}
+
+is_planner_key_running() {
+  local key="$1"
+  for k in ${PLANNER_KEYS[@]+"${PLANNER_KEYS[@]}"}; do
+    [[ "$k" == "$key" ]] && return 0
+  done
+  return 1
+}
 
 WORKER_PID=""
 WORKER_KEY=""
@@ -140,9 +155,12 @@ write_state() {
 # ---------------------------------------------------------------------------
 update_running_file() {
   local entries=""
-  if [[ -n "$PLANNER_PID" ]]; then
-    entries+="{\"role\":\"planner\",\"repo\":\"$PLANNER_REPO\",\"num\":$PLANNER_NUM,\"status\":\"running\",\"started\":\"$PLANNER_STARTED\"}"
-  fi
+  # All active planners
+  for i in "${!PLANNER_PIDS[@]}"; do
+    [[ -n "$entries" ]] && entries+=","
+    entries+="{\"role\":\"planner\",\"repo\":\"${PLANNER_REPOS[$i]}\",\"num\":${PLANNER_NUMS[$i]},\"status\":\"running\",\"started\":\"${PLANNER_STARTEDS[$i]}\"}"
+  done
+  # Single worker
   if [[ -n "$WORKER_PID" ]]; then
     [[ -n "$entries" ]] && entries+=","
     entries+="{\"role\":\"worker\",\"repo\":\"$WORKER_REPO\",\"num\":$WORKER_NUM,\"status\":\"running\",\"started\":\"$WORKER_STARTED\",\"worktree\":\"$WORKER_WORKTREE\"}"
@@ -230,8 +248,9 @@ create_worktree() {
     # Resume existing worktree — sync with main
     (
       cd "$worktree_dir"
-      git fetch origin || true
+      git fetch origin --recurse-submodules || true
       git merge origin/main --no-edit || true
+      git submodule sync --recursive || true
       git submodule update --init --recursive || true
     ) >/dev/null 2>&1
     echo "$worktree_dir"
@@ -240,7 +259,7 @@ create_worktree() {
 
   (
     cd "$repo_dir"
-    git fetch origin || true
+    git fetch origin --recurse-submodules || true
 
     local branch_name="agent/issue-${num}"
 
@@ -250,6 +269,7 @@ create_worktree() {
     fi
 
     cd "$worktree_dir"
+    git submodule sync --recursive || true
     git submodule update --init --recursive || true
   ) >/dev/null 2>&1
 
@@ -426,10 +446,8 @@ BOARD
   prompt_content=$(cat "$prompt_file")
   rm -f "$prompt_file"
 
-  PLANNER_REPO="$repo"
-  PLANNER_NUM="$num"
-  PLANNER_KEY="$issue_key"
-  PLANNER_STARTED="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  local started
+  started="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 
   # Spawn in background
   (
@@ -443,10 +461,16 @@ BOARD
       --output-format stream-json 2>>"$log_file.err" \
     | python3 -u "$PARSER" >> "$log_file"
   ) &
-  PLANNER_PID=$!
+
+  # Track in parallel arrays
+  PLANNER_PIDS+=($!)
+  PLANNER_KEYS+=("$issue_key")
+  PLANNER_REPOS+=("$repo")
+  PLANNER_NUMS+=("$num")
+  PLANNER_STARTEDS+=("$started")
   update_running_file
 
-  log "PLANNER: Spawned PID $PLANNER_PID for $issue_key"
+  log "PLANNER: Spawned PID $! for $issue_key ($(active_planner_count)/$MAX_PLANNERS)"
 }
 
 # ---------------------------------------------------------------------------
@@ -649,24 +673,33 @@ BOARD
 # Reap finished agents
 # ---------------------------------------------------------------------------
 reap_agents() {
-  if [[ -n "$PLANNER_PID" ]]; then
-    if ! kill -0 "$PLANNER_PID" 2>/dev/null; then
-      wait "$PLANNER_PID" 2>/dev/null || true
-      log "PLANNER: $PLANNER_KEY finished"
-
-      # Update planner fingerprint
+  # Reap finished planners — rebuild arrays without finished entries
+  local new_pids=() new_keys=() new_repos=() new_nums=() new_starteds=()
+  local planners_reaped=false
+  for i in "${!PLANNER_PIDS[@]}"; do
+    if kill -0 "${PLANNER_PIDS[$i]}" 2>/dev/null; then
+      # Still running — keep
+      new_pids+=("${PLANNER_PIDS[$i]}")
+      new_keys+=("${PLANNER_KEYS[$i]}")
+      new_repos+=("${PLANNER_REPOS[$i]}")
+      new_nums+=("${PLANNER_NUMS[$i]}")
+      new_starteds+=("${PLANNER_STARTEDS[$i]}")
+    else
+      # Finished — reap and update fingerprint
+      wait "${PLANNER_PIDS[$i]}" 2>/dev/null || true
+      log "PLANNER: ${PLANNER_KEYS[$i]} finished"
       local new_info
-      new_info=$(get_issue_info "$PLANNER_REPO" "$PLANNER_NUM")
-      [[ "$new_info" != "error" ]] && write_state "planner" "$PLANNER_KEY" "$new_info"
-
-      PLANNER_PID=""
-      PLANNER_KEY=""
-      PLANNER_REPO=""
-      PLANNER_NUM=""
-      PLANNER_STARTED=""
-      update_running_file
+      new_info=$(get_issue_info "${PLANNER_REPOS[$i]}" "${PLANNER_NUMS[$i]}")
+      [[ "$new_info" != "error" ]] && write_state "planner" "${PLANNER_KEYS[$i]}" "$new_info"
+      planners_reaped=true
     fi
-  fi
+  done
+  PLANNER_PIDS=(${new_pids[@]+"${new_pids[@]}"})
+  PLANNER_KEYS=(${new_keys[@]+"${new_keys[@]}"})
+  PLANNER_REPOS=(${new_repos[@]+"${new_repos[@]}"})
+  PLANNER_NUMS=(${new_nums[@]+"${new_nums[@]}"})
+  PLANNER_STARTEDS=(${new_starteds[@]+"${new_starteds[@]}"})
+  $planners_reaped && update_running_file
 
   if [[ -n "$WORKER_PID" ]]; then
     if ! kill -0 "$WORKER_PID" 2>/dev/null; then
@@ -725,7 +758,7 @@ poll() {
     checked=$((checked + 1))
 
     # Skip if this issue is already running
-    [[ "$issue_key" == "${PLANNER_KEY:-}" ]] && continue
+    is_planner_key_running "$issue_key" && continue
     [[ "$issue_key" == "${WORKER_KEY:-}" ]] && continue
 
     # Get issue info (1 API call)
@@ -740,14 +773,18 @@ poll() {
     # Skip closed
     [[ "$is_open" != "true" ]] && continue
 
-    # agent-waiting: check if human replied → auto-remove label
+    # agent-waiting: check if human replied → auto-remove label and route immediately
     if [[ "$agent_waiting" == "true" ]]; then
       if [[ "$last_author" != "none" && "$last_author" != "$BOT_LOGIN" ]]; then
-        log "Human replied on $issue_key — removing agent-waiting label"
+        log "Human replied on $issue_key — removing agent-waiting label, routing now"
         gh issue edit "$num" --repo "$ORG/$repo" --remove-label "agent-waiting" 2>/dev/null || true
+        # Update fingerprint to reflect removed label, then fall through to routing
+        agent_waiting="false"
+        info="${comment_count}:${assigned_to_bot}:${agent_waiting}:${plan_approved}:${last_author}:${is_open}"
+      else
+        # Still waiting for human reply — skip
+        continue
       fi
-      # Skip this cycle — pick up next poll with updated fingerprint
-      continue
     fi
 
     # Route based on plan-approved label
@@ -767,21 +804,25 @@ poll() {
 
   done <<< "$issues"
 
-  # Spawn planner if idle and candidates exist
-  if [[ -z "$PLANNER_PID" && ${#planner_candidates[@]} -gt 0 ]]; then
-    local candidate="${planner_candidates[0]}"
+  # Spawn planners for all candidates (up to available slots)
+  local planner_slots=$(( MAX_PLANNERS - $(active_planner_count) ))
+  local planners_spawned=0
+  for candidate in ${planner_candidates[@]+"${planner_candidates[@]}"}; do
+    [[ $planners_spawned -ge $planner_slots ]] && break
+
     local p_repo p_num p_key p_fingerprint
     IFS=$'\t' read -r p_repo p_num p_key p_fingerprint <<< "$candidate"
 
     local p_item_id
     p_item_id=$(get_item_id "$p_repo" "$p_num")
 
-    write_state "planner" "$p_key" "$p_fingerprint"
-    run_planner "$p_repo" "$p_num" "$p_key" "$p_item_id" || {
+    if run_planner "$p_repo" "$p_num" "$p_key" "$p_item_id"; then
+      write_state "planner" "$p_key" "$p_fingerprint"
+      planners_spawned=$((planners_spawned + 1))
+    else
       log "PLANNER: Failed to start for $p_key"
-      PLANNER_PID=""
-    }
-  fi
+    fi
+  done
 
   # Spawn worker if idle and candidates exist
   if [[ -z "$WORKER_PID" && ${#worker_candidates[@]} -gt 0 ]]; then
@@ -802,7 +843,13 @@ poll() {
   local gql_after
   gql_after=$(graphql_remaining)
   local gql_used=$((gql_before - gql_after))
-  log "Poll complete. Checked $checked issues. Planner: ${PLANNER_KEY:-idle}. Worker: ${WORKER_KEY:-idle}. GraphQL: $gql_before→$gql_after (used $gql_used)"
+  local planner_summary
+  if [[ $(active_planner_count) -gt 0 ]]; then
+    planner_summary="$(active_planner_count) active"
+  else
+    planner_summary="idle"
+  fi
+  log "Poll complete. Checked $checked issues. Planners: $planner_summary. Worker: ${WORKER_KEY:-idle}. GraphQL: $gql_before→$gql_after (used $gql_used)"
 }
 
 # ---------------------------------------------------------------------------
@@ -812,11 +859,11 @@ shutdown() {
   log "Workstrator shutting down..."
 
   # Kill running agents
-  if [[ -n "$PLANNER_PID" ]]; then
-    kill "$PLANNER_PID" 2>/dev/null || true
-    wait "$PLANNER_PID" 2>/dev/null || true
-    log "Killed planner PID $PLANNER_PID"
-  fi
+  for i in "${!PLANNER_PIDS[@]}"; do
+    kill "${PLANNER_PIDS[$i]}" 2>/dev/null || true
+    wait "${PLANNER_PIDS[$i]}" 2>/dev/null || true
+    log "Killed planner PID ${PLANNER_PIDS[$i]} (${PLANNER_KEYS[$i]})"
+  done
   if [[ -n "$WORKER_PID" ]]; then
     kill "$WORKER_PID" 2>/dev/null || true
     wait "$WORKER_PID" 2>/dev/null || true
@@ -842,6 +889,7 @@ log "  Bot:            $BOT_LOGIN"
 log "  Repos:          $REPOS"
 log "  Poll interval:  ${POLL_INTERVAL}s"
 log "  Agent model:    $AGENT_MODEL"
+log "  Max planners:   $MAX_PLANNERS"
 log "=========================================="
 
 while true; do
