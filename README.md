@@ -4,7 +4,7 @@ An autonomous agent orchestrator that watches your GitHub project board and disp
 
 ## How It Works
 
-Multiple **Planner** agents and a single **Worker** agent run in parallel:
+Three specialized agent types work together:
 
 ```
                    GitHub Issues
@@ -24,17 +24,27 @@ Multiple **Planner** agents and a single **Worker** agent run in parallel:
   Revise on feedback          git worktree
   Detect approval             Self-reviews
   Add plan-approved label     Creates PR
-  Create sub-issues           Posts results
-          │                         │
-          └────────────┬────────────┘
-                       │
-               agent-waiting label
-              (ball in human's court)
+  Create sub-issues                │
+          │                   ┌────┴────┐
+          │                   │REVIEWERS│
+          │                   │(up to M)│
+          │                   └────┬────┘
+          │                        │
+          │                   Review PR
+          │                   Push fixes
+          │                   Approve/Request Changes
+          │                        │
+          └───────────┬────────────┘
+                      │
+              agent-waiting label
+             (ball in human's court)
 ```
 
 **Planners** (up to `MAX_PLANNERS` concurrent, default 5) read issues and the codebase, write implementation plans, revise them based on feedback, and when the human approves, add the `plan-approved` label. They run in the repo root directory (read-only — never modify code). Multiple planners can work on different issues simultaneously.
 
 **Worker** picks up issues with `plan-approved`, creates an isolated git worktree, implements the plan, self-reviews against the repo's CLAUDE.md standards, and creates a PR. It runs in the worktree so it never conflicts with your working copy.
+
+**Reviewers** (up to `MAX_REVIEWERS` concurrent, default 3) are automatically triggered when a Worker creates a PR. They run two parallel review passes — semantic (plan alignment, scope) and engineering (CLAUDE.md standards) — push deterministic fixes, and submit a GitHub PR review. If the PR receives new commits after review, the reviewer re-reviews only the delta.
 
 ### Signal Model
 
@@ -43,6 +53,7 @@ Multiple **Planner** agents and a single **Worker** agent run in parallel:
 | Assign issue to bot account | "Work on this" |
 | `agent-waiting` label | Bot posted something, waiting for human |
 | `plan-approved` label | Plan approved, worker should implement |
+| Worker creates PR | Reviewer auto-triggered to review |
 | Human replies (while `agent-waiting`) | Label auto-removed, agent re-engages immediately |
 | Close issue | Done, agent ignores it |
 
@@ -54,8 +65,9 @@ Multiple **Planner** agents and a single **Worker** agent run in parallel:
 4. If feedback: **Planner** revises, re-posts, adds `agent-waiting` again
 5. If approved: **Planner** adds `plan-approved` label
 6. **Worker** creates a git worktree, implements, self-reviews, creates a PR, adds `agent-waiting`
-7. You review the PR — merge or request changes
-8. If changes needed: **Worker** re-engages when you comment
+7. **Reviewer** automatically reviews the PR (semantic + engineering checks), pushes deterministic fixes, approves or requests changes
+8. You review the PR — merge or request changes
+9. If changes needed: **Worker** re-engages when you comment, **Reviewer** re-reviews the delta
 
 For stories/epics, the **Planner** decomposes them into sub-issues (each auto-assigned to the bot with `plan-approved`), and the **Worker** implements them one at a time.
 
@@ -124,6 +136,7 @@ BOT_LOGIN="your-bot-account"
 REPOS="repo-a repo-b repo-c"
 AGENT_MODEL="opus"
 MAX_PLANNERS=5       # concurrent planner agents (default: 5)
+MAX_REVIEWERS=3      # concurrent reviewer agents (default: 3)
 ```
 
 ### 3. Find Project Board IDs
@@ -239,15 +252,15 @@ python3 dashboard.py
 
 Split-pane terminal UI:
 - **Header**: Poll countdown, GraphQL remaining, service status
-- **Left pane**: Running agents (Planners/Worker), issue queue, recent orchestrator log
-- **Right pane**: Live agent output (auto-selects most recent planner when multiple are running)
+- **Left pane**: Running agents (Planners/Worker/Reviewers), issue queue, recent orchestrator log
+- **Right pane**: Live agent output (auto-selects: worker > reviewer > most recent planner)
 
 ### Keybindings
 
 | Key | Action |
 |---|---|
 | `Up` / `Down` | Select issue in queue |
-| `Tab` | Cycle right pane: Auto → Planner → Worker → Auto |
+| `Tab` | Cycle right pane: Auto → Planner → Worker → Reviewer → Auto |
 | `PgUp` / `PgDn` | Scroll agent log |
 | `r` | Force refresh |
 | `q` | Quit |
@@ -303,7 +316,7 @@ The orchestrator logs GraphQL usage every poll cycle:
 
 ```
 Polling... (GraphQL remaining: 4685)
-Poll complete. Checked 5 issues. Planners: 2 active. Worker: idle. GraphQL: 4685→4664 (used 21)
+Poll complete. Checked 5 issues. Planners: 2 active. Worker: idle. Reviewers: 1 active. GraphQL: 4685→4664 (used 21)
 ```
 
 The dashboard also shows a live poll countdown and GraphQL remaining in the header bar.
@@ -317,7 +330,7 @@ The dashboard also shows a live poll countdown and GraphQL remaining in the head
 1. **Is the repo in REPOS?** Check `REPOS=` in `config.sh`.
 2. **Is the issue assigned to the bot?** Check `gh issue view NUM --repo ORG/REPO --json assignees`.
 3. **Does `agent-waiting` need removal?** If the bot posted and is waiting, reply to trigger auto-removal.
-4. **Check the fingerprint**: `cat state/planner-REPO-NUM` or `state/worker-REPO-NUM`. Delete the state file to force reprocessing.
+4. **Check the fingerprint**: `cat state/planner-REPO-NUM` or `state/worker-REPO-NUM` or `state/reviewer-REPO-pr-NUM`. Delete the state file to force reprocessing.
 
 ### Worker fails to create worktree
 
@@ -363,8 +376,10 @@ The dashboard also shows a live poll countdown and GraphQL remaining in the head
 | `logs/workstrator.log` | Orchestrator log (polls, agent lifecycle) |
 | `logs/planner-*.log` | Per-run planner output |
 | `logs/worker-*.log` | Per-run worker output |
+| `logs/reviewer-*.log` | Per-run reviewer output |
 | `state/planner-*` | Planner fingerprints (prevents re-processing unchanged issues) |
 | `state/worker-*` | Worker fingerprints |
+| `state/reviewer-*` | Reviewer fingerprints (3-line: fingerprint, last-reviewed SHA, issue num) |
 | `running.json` | Currently running agents (read by dashboard) |
 | `board-cache.json` | Project board snapshot (written by workstrator, read by dashboard) |
 | `.lock/` | Single-instance lock (mkdir-based, atomic) |

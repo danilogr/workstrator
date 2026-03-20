@@ -31,6 +31,9 @@ AGENT_MODEL="opus"
 # Max concurrent planner agents (default: 5)
 MAX_PLANNERS=5
 
+# Max concurrent reviewer agents (default: 3)
+MAX_REVIEWERS=3
+
 # ── Repos ────────────────────────────────────────────────────────────
 
 # Space-separated list of GitHub repo names to monitor.
@@ -63,6 +66,7 @@ STATUS_FIELD_ID=""           # Status field
 PRIORITY_FIELD_ID=""         # Priority field (optional)
 SIZE_FIELD_ID=""             # Size field (optional)
 CATEGORY_FIELD_ID=""         # Category field (optional)
+ITERATION_FIELD_ID=""        # Iteration field (optional — enables sprint assignment)
 
 # Status option IDs (required — used for board updates)
 STATUS_TODO=""               # e.g., f75ad846

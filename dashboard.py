@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Workstrator Dashboard — split-pane terminal UI with planner + worker agents."""
+"""Workstrator v4 Dashboard — split-pane terminal UI with planner + worker + reviewer agents."""
 
 import curses
 import json
@@ -217,12 +217,15 @@ class Dashboard:
         curses.init_pair(9, curses.COLOR_WHITE, curses.COLOR_BLUE)   # status bar
         curses.init_pair(10, curses.COLOR_BLACK, curses.COLOR_YELLOW)  # planner
         curses.init_pair(11, curses.COLOR_BLACK, curses.COLOR_MAGENTA)  # worker
+        curses.init_pair(12, curses.COLOR_BLACK, curses.COLOR_GREEN)  # reviewer
 
     def _rebuild_non_done(self):
         """Rebuild the filtered + sorted issue list and clamp selection."""
         running_keys = set()
         for agent in self.running_agents:
-            running_keys.add(f"{agent.get('repo')}-{agent.get('num')}")
+            # Reviewers use issue_num to map back to the issue queue
+            num = agent.get("issue_num", agent.get("num"))
+            running_keys.add(f"{agent.get('repo')}-{num}")
 
         self.non_done = [i for i in self.issues if i["status"] != "Done"]
 
@@ -243,7 +246,7 @@ class Dashboard:
 
     def _get_log_for_display(self) -> tuple[str, list[str]]:
         """Determine which log to show in the right pane based on state + role filter."""
-        role = self.active_log_role  # None, "planner", or "worker"
+        role = self.active_log_role  # None, "planner", "worker", or "reviewer"
 
         # If agents are running, show the running agent's log
         if self.running_agents:
@@ -251,16 +254,18 @@ class Dashboard:
                 # User pinned a specific role — find that agent
                 for agent in self.running_agents:
                     if agent.get("role") == role:
-                        key = f"{agent.get('repo')}-{agent.get('num')}"
+                        # Reviewers store their key in running.json; planners/workers use repo-num
+                        key = agent.get("key", f"{agent.get('repo')}-{agent.get('num')}")
                         label = f"{role.title()}: {agent.get('repo')}#{agent.get('num')}"
                         return label, get_agent_logs(role, key)
             else:
                 # Auto: prefer worker, then most recent planner
-                for preferred in ("worker", "planner"):
+                for preferred in ("worker", "reviewer", "planner"):
                     matching = [a for a in self.running_agents if a.get("role") == preferred]
                     if matching:
                         agent = max(matching, key=lambda a: a.get("started", ""))
-                        key = f"{agent.get('repo')}-{agent.get('num')}"
+                        # Reviewers store their key in running.json; planners/workers use repo-num
+                        key = agent.get("key", f"{agent.get('repo')}-{agent.get('num')}")
                         r = agent.get("role", "agent")
                         label = f"{r.title()}: {agent.get('repo')}#{agent.get('num')}"
                         if len(matching) > 1:
@@ -328,7 +333,7 @@ class Dashboard:
         status_color = curses.color_pair(1) if self.workstrator_running else curses.color_pair(3)
 
         self.safe_addstr(0, 0, " " * w, curses.color_pair(8) | curses.A_BOLD)
-        self.safe_addstr(0, 1, "Workstrator", curses.color_pair(8) | curses.A_BOLD)
+        self.safe_addstr(0, 1, "Workstrator v4", curses.color_pair(8) | curses.A_BOLD)
 
         # Show agent count
         right_offset = len(status) + 3
@@ -368,10 +373,14 @@ class Dashboard:
                     icon = "P"
                     color = curses.color_pair(10) | curses.A_BOLD
                     label_color = curses.color_pair(2) | curses.A_BOLD
-                else:
+                elif role == "worker":
                     icon = "W"
                     color = curses.color_pair(11) | curses.A_BOLD
                     label_color = curses.color_pair(5) | curses.A_BOLD
+                else:
+                    icon = "R"
+                    color = curses.color_pair(12) | curses.A_BOLD
+                    label_color = curses.color_pair(1) | curses.A_BOLD
 
                 self.safe_addstr(y, 1, f" {icon} ", color)
                 self.safe_addstr(y, 5, f"{role.title()}: {repo}#{num}", label_color)
@@ -391,7 +400,9 @@ class Dashboard:
         # Build running agent keys for highlighting
         running_keys = set()
         for agent in self.running_agents:
-            running_keys.add(f"{agent.get('repo')}-{agent.get('num')}")
+            # Reviewers use issue_num to map back to the issue queue
+            num = agent.get("issue_num", agent.get("num"))
+            running_keys.add(f"{agent.get('repo')}-{num}")
 
         # Calculate available rows for queue (leave 7 lines for log section + 1 gap)
         queue_rows = max(0, (h - 8) - y)
@@ -416,7 +427,8 @@ class Dashboard:
                 role_marker = "  "
                 if is_running:
                     for agent in self.running_agents:
-                        if f"{agent.get('repo')}-{agent.get('num')}" == issue["key"]:
+                        agent_issue_key = f"{agent.get('repo')}-{agent.get('issue_num', agent.get('num'))}"
+                        if agent_issue_key == issue["key"]:
                             role_marker = f" {agent.get('role', '?')[0].upper()}>"
                             break
 
@@ -452,6 +464,8 @@ class Dashboard:
                 attr = curses.color_pair(2)
             elif "WORKER:" in line:
                 attr = curses.color_pair(5)
+            elif "REVIEWER:" in line:
+                attr = curses.color_pair(1)
             elif "finished" in line:
                 attr = curses.color_pair(1)
             elif "Poll complete" in line:
@@ -551,11 +565,13 @@ class Dashboard:
             self.log_scroll = max(0, self.log_scroll - (h // 2))
 
         elif key == ord("\t"):
-            # Tab: cycle through None → planner → worker → None
+            # Tab: cycle through None → planner → worker → reviewer → None
             if self.active_log_role is None:
                 self.active_log_role = "planner"
             elif self.active_log_role == "planner":
                 self.active_log_role = "worker"
+            elif self.active_log_role == "worker":
+                self.active_log_role = "reviewer"
             else:
                 self.active_log_role = None  # back to auto
             self.log_scroll = 0
