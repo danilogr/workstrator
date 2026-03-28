@@ -359,6 +359,18 @@ The dashboard also shows a live poll countdown and GraphQL remaining in the head
 
 ---
 
+## Known Issues & Notes
+
+### Reviewer fingerprint: spec/code mismatch
+
+The spec says `review_comment_count` in the fingerprint format, but `get_pr_info()` uses `.reviews | length` (review submissions, not inline comments). The implementation is more correct — a new review submission is a meaningful state change, while inline comment count is noisier. The spec should be updated to say `review_count` to match.
+
+### Re-review scan API cost
+
+Every poll cycle calls `get_pr_info()` for each `state/reviewer-*` file. At 180s intervals this is fine for a handful of open PRs, but if state files accumulate (e.g., cleanup fails), it could add up. The `MERGED`/`CLOSED` cleanup path mitigates this — just worth monitoring. If you see GraphQL usage climbing, check `ls state/reviewer-*` for stale files.
+
+---
+
 ## Files Reference
 
 | File | Purpose |

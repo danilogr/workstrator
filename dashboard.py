@@ -340,7 +340,7 @@ class Dashboard:
         if self.running_agents:
             roles = "/".join(a.get("role", "?")[0].upper() for a in self.running_agents)
             agent_info = f" [{roles}] "
-            self.safe_addstr(0, 13, agent_info, curses.color_pair(8))
+            self.safe_addstr(0, 16, agent_info, curses.color_pair(8))
 
         # Poll countdown + GraphQL remaining — center area of header
         mid_parts: list[str] = []

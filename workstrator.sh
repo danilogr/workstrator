@@ -140,6 +140,10 @@ PENDING_REVIEWER_PR=""
 PENDING_REVIEWER_ISSUE=""
 PENDING_REVIEWER_KEY=""
 
+# Poll counter for periodic tasks (PR discovery runs every 5th poll = ~15 min)
+POLL_COUNT=0
+PR_SCAN_INTERVAL=5
+
 # ---------------------------------------------------------------------------
 # Single-instance lock (mkdir is atomic)
 # ---------------------------------------------------------------------------
@@ -440,6 +444,16 @@ run_planner() {
     log "PLANNER ERROR: Directory $work_dir does not exist for repo $repo"
     return 1
   fi
+
+  # Ensure planner reads latest main — checkout main, pull, update submodules
+  log "PLANNER: Syncing $repo to origin/main"
+  (
+    cd "$work_dir"
+    git fetch origin 2>/dev/null || true
+    git checkout main 2>/dev/null || git checkout master 2>/dev/null || true
+    git merge origin/main --ff-only 2>/dev/null || git merge origin/master --ff-only 2>/dev/null || true
+    git submodule update --init --recursive 2>/dev/null || true
+  ) >/dev/null 2>&1
 
   # Fetch issue context
   local issue_json
@@ -1233,6 +1247,58 @@ reap_agents() {
 }
 
 # ---------------------------------------------------------------------------
+# Discover open PRs by bot that have no reviewer state (runs every Nth poll)
+# ---------------------------------------------------------------------------
+scan_open_prs() {
+  local discovered=0
+  for repo in $REPOS; do
+    # List open, non-draft PRs authored by the bot
+    local prs
+    prs=$(gh pr list --repo "$ORG/$repo" --author "$BOT_LOGIN" --state open \
+      --json number,isDraft,headRefName \
+      --jq '[.[] | select(.isDraft | not)] | .[].number' 2>/dev/null) || continue
+    [[ -z "$prs" ]] && continue
+
+    while read -r pr_num; do
+      [[ -z "$pr_num" ]] && continue
+      local reviewer_key="${repo}-pr-${pr_num}"
+
+      # Skip if already tracked, running, or pending
+      [[ -f "$STATE_DIR/reviewer-$reviewer_key" ]] && continue
+      is_reviewer_key_running "$reviewer_key" && continue
+      [[ "$reviewer_key" == "$PENDING_REVIEWER_KEY" ]] && continue
+
+      # Try to find the linked issue number from the PR body
+      local issue_num
+      issue_num=$(gh pr view "$pr_num" --repo "$ORG/$repo" \
+        --json body --jq '.body' 2>/dev/null \
+        | grep -oE '(closes|fixes|resolves|ref) #[0-9]+' \
+        | head -1 | grep -oE '[0-9]+') || true
+      [[ -z "$issue_num" ]] && issue_num="0"
+
+      local reviewer_slots=$(( MAX_REVIEWERS - $(active_reviewer_count) ))
+      if [[ $reviewer_slots -gt 0 ]]; then
+        log "PR-SCAN: Discovered unreviewed PR $ORG/$repo#$pr_num — spawning reviewer"
+        run_reviewer "$repo" "$pr_num" "$issue_num" "$reviewer_key" || \
+          log "PR-SCAN: Failed to start reviewer for $reviewer_key"
+        discovered=$((discovered + 1))
+      else
+        # Queue for next cycle if no slots
+        if [[ -z "$PENDING_REVIEWER_KEY" ]]; then
+          PENDING_REVIEWER_REPO="$repo"
+          PENDING_REVIEWER_PR="$pr_num"
+          PENDING_REVIEWER_ISSUE="$issue_num"
+          PENDING_REVIEWER_KEY="$reviewer_key"
+          log "PR-SCAN: Discovered unreviewed PR $ORG/$repo#$pr_num — queued (no slots)"
+        fi
+        discovered=$((discovered + 1))
+      fi
+    done <<< "$prs"
+  done
+  [[ $discovered -gt 0 ]] && log "PR-SCAN: Discovered $discovered unreviewed PR(s)"
+}
+
+# ---------------------------------------------------------------------------
 # Poll and route issues to planner or worker
 # ---------------------------------------------------------------------------
 poll() {
@@ -1484,5 +1550,12 @@ log "=========================================="
 
 while true; do
   poll || log "Poll cycle failed, will retry next cycle"
+
+  # Periodic PR discovery scan (every Nth poll, and on first poll)
+  POLL_COUNT=$((POLL_COUNT + 1))
+  if [[ $POLL_COUNT -eq 1 || $((POLL_COUNT % PR_SCAN_INTERVAL)) -eq 0 ]]; then
+    scan_open_prs || log "PR scan failed, will retry next cycle"
+  fi
+
   sleep "$POLL_INTERVAL"
 done
