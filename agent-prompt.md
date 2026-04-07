@@ -420,7 +420,7 @@ AUTHOR_LOGIN=$(gh issue view $NUM --repo $ORG/$REPO --json author --jq '.author.
 git commit -m "$(cat <<EOF
 <concise commit message>
 
-Ref #$NUM
+Ref $ORG/$REPO#$NUM
 
 Co-Authored-By: $AUTHOR_LOGIN <$AUTHOR_LOGIN@users.noreply.github.com>
 Co-Authored-By: $BOT_LOGIN <$BOT_LOGIN@users.noreply.github.com>
@@ -482,3 +482,4 @@ or
 8. **Always add `agent-waiting` after posting** — this is how you signal your turn is done.
 9. **Reviewers: never merge PRs.** Only approve or request changes.
 10. **Reviewers: only modify files in the PR diff.** No drive-by changes to unrelated files.
+11. **Always use full-path issue references.** Write `$ORG/repo#123`, never bare `#123`. The project board aggregates multiple repos — bare references resolve to the wrong issue.

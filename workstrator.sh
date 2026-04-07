@@ -1050,7 +1050,7 @@ Fix commits must follow:
 ```
 fix: <description>
 
-Ref #ISSUE_NUM
+Ref ${ORG}/REPO#ISSUE_NUM
 
 Co-Authored-By: $BOT_LOGIN <$BOT_LOGIN@users.noreply.github.com>
 ```
