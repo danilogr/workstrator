@@ -1296,6 +1296,7 @@ scan_open_prs() {
     done <<< "$prs"
   done
   [[ $discovered -gt 0 ]] && log "PR-SCAN: Discovered $discovered unreviewed PR(s)"
+  return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -1322,7 +1323,7 @@ poll() {
   if [[ -z "$issues" ]]; then
     local gql_after
     gql_after=$(graphql_remaining)
-    log "No issues assigned to bot. GraphQL: $gql_before→$gql_after (used $((gql_before - gql_after)))"
+    log "No issues assigned to bot. GraphQL: $gql_before→$gql_after (used $(( ${gql_before:-0} - ${gql_after:-0} )))"
     return 0
   fi
 
@@ -1486,7 +1487,7 @@ poll() {
 
   local gql_after
   gql_after=$(graphql_remaining)
-  local gql_used=$((gql_before - gql_after))
+  local gql_used=$(( ${gql_before:-0} - ${gql_after:-0} ))
   local planner_summary
   if [[ $(active_planner_count) -gt 0 ]]; then
     planner_summary="$(active_planner_count) active"
